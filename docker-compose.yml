@@ -1,0 +1,51 @@
+services:
+  broker:
+    build:
+      context: ./broker
+    container_name: broker
+
+  server1:
+    build:
+      context: ./server
+    container_name: server1
+    environment:
+      - SERVER_ID=1
+    volumes:
+      - server1_data:/data
+    depends_on:
+      - broker
+
+  server2:
+    build:
+      context: ./server
+    container_name: server2
+    environment:
+      - SERVER_ID=2
+    volumes:
+      - server2_data:/data
+    depends_on:
+      - broker
+
+  client1:
+    build:
+      context: ./client
+    container_name: client1
+    environment:
+      - CLIENT_ID=bot1
+      - BROKER_HOST=broker
+    depends_on:
+      - broker
+
+  client2:
+    build:
+      context: ./client
+    container_name: client2
+    environment:
+      - CLIENT_ID=bot2
+      - BROKER_HOST=broker
+    depends_on:
+      - broker
+
+volumes:
+  server1_data:
+  server2_data:
