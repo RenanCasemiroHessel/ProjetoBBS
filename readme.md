@@ -11,9 +11,13 @@ A comunicação entre todos os serviços é intermediada por um broker central.
 
 ## Arquitetura
 
-client1 (Java) ─┐ ┌─ server1 (Python)
-           |-- broker --|
+```
+client1 (Java) ─┐ ┌─ server1 (Python)   
+
+           |-- broker --|            
+
 client2 (Java) ─┘ └─ server2 (Python)
+```
 
 O broker recebe as requisições dos clientes e as distribui entre os servidores
 disponíveis usando o padrão ROUTER/DEALER do ZeroMQ.
@@ -46,16 +50,18 @@ para estruturar as mensagens enviadas pelo cliente.
   
 ## Estrutura do Projeto
 
+```
 ProjetoBBS/
-|--broker/
-| |-- Dockerfile
-| |-- broker.py
-|-- server/
-| |-- Dockerfile
-| |-- server.py
-|-- client/
-| |-- Dockerfile
-| |-- pom.xml
-| |-- src/main/java/com/projetobbs/Client.java
-|-- docker-compose.yml
-|-- README.md
+├── broker/
+│   ├── Dockerfile
+│   └── broker.py
+├── server/
+│   ├── Dockerfile
+│   └── server.py
+├── client/
+│   ├── Dockerfile
+│   ├── pom.xml
+│   └── src/main/java/com/projetobbs/Client.java
+├── docker-compose.yml
+└── README.md
+```
