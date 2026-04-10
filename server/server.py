@@ -11,7 +11,7 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {"logins": [], "channels": []}
+    return {"logins": [], "channels": [], "messages": []}
 
 def save_data(data):
     os.makedirs("/data", exist_ok=True)
@@ -19,14 +19,18 @@ def save_data(data):
         json.dump(data, f, indent=2)
 
 context = zmq.Context()
-socket = context.socket(zmq.REP)
-socket.connect("tcp://broker:5556")
+
+rep_socket = context.socket(zmq.REP)
+rep_socket.connect("tcp://broker:5556")
+
+pub_socket = context.socket(zmq.PUB)
+pub_socket.connect("tcp://pubsub_proxy:5557")
 
 data = load_data()
-print(f"[SERVER-{SERVER_ID}] Iniciado e conectado ao broker.", flush=True)
+print(f"[SERVER-{SERVER_ID}] Iniciado e conectado.", flush=True)
 
 while True:
-    raw = socket.recv()
+    raw = rep_socket.recv()
     msg = msgpack.unpackb(raw, raw=False)
     action = msg.get("action")
     timestamp = msg.get("timestamp")
@@ -56,8 +60,36 @@ while True:
     elif action == "list_channels":
         resp = {"status": "ok", "channels": data["channels"], "timestamp": time.time()}
 
+    elif action == "publish":
+        channel = msg.get("channel", "")
+        message = msg.get("message", "")
+        username = msg.get("username", "")
+        if not channel:
+            resp = {"status": "error", "message": "Nome do canal obrigatorio", "timestamp": time.time()}
+        elif not message:
+            resp = {"status": "error", "message": "Mensagem vazia", "timestamp": time.time()}
+        else:
+            if channel not in data["channels"]:
+                data["channels"].append(channel)
+                save_data(data)
+                print(f"[SERVER-{SERVER_ID}] Canal '{channel}' replicado de outro servidor.", flush=True)
+            pub_payload = {
+                "channel": channel,
+                "message": message,
+                "username": username,
+                "timestamp": timestamp
+            }
+            pub_socket.send_multipart([
+                channel.encode(),
+                msgpack.packb(pub_payload)
+            ])
+            data["messages"].append(pub_payload)
+            save_data(data)
+            resp = {"status": "ok", "message": "Mensagem publicada", "timestamp": time.time()}
+            print(f"[SERVER-{SERVER_ID}] PUB  | canal={channel} | user={username} | msg={message}", flush=True)
+
     else:
         resp = {"status": "error", "message": f"Acao desconhecida: {action}", "timestamp": time.time()}
 
     print(f"[SERVER-{SERVER_ID}] SEND | status={resp['status']} | {resp.get('message', resp.get('channels'))}", flush=True)
-    socket.send(msgpack.packb(resp))
+    rep_socket.send(msgpack.packb(resp))
