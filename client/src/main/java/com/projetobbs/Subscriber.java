@@ -16,9 +16,11 @@ public class Subscriber implements Runnable {
     private final ZMQ.Socket subSocket;
     private final String clientId;
     private final List<String> subscribedChannels = new ArrayList<>();
+    private final LogicalClock clock;
 
-    public Subscriber(ZContext ctx, String proxyHost, String clientId) {
+    public Subscriber(ZContext ctx, String proxyHost, String clientId, LogicalClock clock) {
         this.clientId = clientId;
+        this.clock = clock;
         this.subSocket = ctx.createSocket(SocketType.SUB);
         this.subSocket.connect("tcp://" + proxyHost + ":5558");
     }
@@ -45,10 +47,16 @@ public class Subscriber implements Runnable {
                 String topic = new String(topicBytes);
                 Map<?, ?> payload = mapper.readValue(payloadBytes, Map.class);
                 long recvTs = Instant.now().getEpochSecond();
+
+                Number msgClock = (Number) payload.get("clock");
+                if (msgClock != null) clock.update(msgClock.longValue());
+
                 System.out.println("[SUBSCRIBER-" + clientId + "] MSG RECEBIDA"
                     + " | canal=" + topic
                     + " | de=" + payload.get("username")
                     + " | msg=" + payload.get("message")
+                    + " | clock_msg=" + msgClock
+                    + " | clock_local=" + clock.get()
                     + " | enviado=" + payload.get("timestamp")
                     + " | recebido=" + recvTs);
             } catch (Exception e) {

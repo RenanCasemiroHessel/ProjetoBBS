@@ -14,11 +14,13 @@ public class Client {
         String brokerHost = System.getenv().getOrDefault("BROKER_HOST", "broker");
         String proxyHost  = System.getenv().getOrDefault("PROXY_HOST", "pubsub_proxy");
 
-        try (ZContext ctx = new ZContext()) {
-            Publisher  publisher  = new Publisher(ctx, brokerHost, clientId);
-            Subscriber subscriber = new Subscriber(ctx, proxyHost, clientId);
+        LogicalClock clock = new LogicalClock();
 
-            Thread.sleep(2000); 
+        try (ZContext ctx = new ZContext()) {
+            Publisher  publisher  = new Publisher(ctx, brokerHost, clientId, clock);
+            Subscriber subscriber = new Subscriber(ctx, proxyHost, clientId, clock);
+
+            Thread.sleep(2000);
 
             Thread subThread = new Thread(subscriber);
             subThread.setDaemon(true);

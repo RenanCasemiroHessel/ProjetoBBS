@@ -14,9 +14,11 @@ public class Publisher {
     private final ZMQ.Socket reqSocket;
     private final String clientId;
     private final Random random = new Random();
+    private final LogicalClock clock;
 
-    public Publisher(ZContext ctx, String brokerHost, String clientId) {
+    public Publisher(ZContext ctx, String brokerHost, String clientId, LogicalClock clock) {
         this.clientId = clientId;
+        this.clock = clock;
         this.reqSocket = ctx.createSocket(SocketType.REQ);
         this.reqSocket.connect("tcp://" + brokerHost + ":5555");
     }
@@ -66,7 +68,11 @@ public class Publisher {
             req.put("channel", channel);
             req.put("message", text);
             Map<String, Object> resp = sendReceive(req);
-            System.out.println("[PUBLISHER-" + clientId + "] SEND pub | canal=" + channel + " | msg=" + text + " | status=" + resp.get("status"));
+            System.out.println("[PUBLISHER-" + clientId + "] SEND pub"
+                + " | canal=" + channel
+                + " | msg=" + text
+                + " | clock=" + req.get("clock")
+                + " | status=" + resp.get("status"));
             Thread.sleep(1000);
         }
     }
@@ -75,15 +81,20 @@ public class Publisher {
         Map<String, Object> msg = new HashMap<>();
         msg.put("action", action);
         msg.put("timestamp", Instant.now().getEpochSecond());
+        msg.put("clock", clock.tick());
         return msg;
     }
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> sendReceive(Map<String, Object> msg) throws Exception {
         byte[] data = mapper.writeValueAsBytes(msg);
-        System.out.println("[PUBLISHER-" + clientId + "] SEND | " + msg);
+        System.out.println("[PUBLISHER-" + clientId + "] SEND | clock=" + msg.get("clock") + " | " + msg);
         reqSocket.send(data);
         byte[] raw = reqSocket.recv();
-        return mapper.readValue(raw, Map.class);
+        Map<String, Object> resp = mapper.readValue(raw, Map.class);
+        Number recvClock = (Number) resp.get("clock");
+        if (recvClock != null) clock.update(recvClock.longValue());
+        System.out.println("[PUBLISHER-" + clientId + "] RECV | clock=" + clock.get() + " | " + resp);
+        return resp;
     }
 }

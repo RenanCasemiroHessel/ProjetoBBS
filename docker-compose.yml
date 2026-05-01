@@ -1,8 +1,15 @@
 services:
+  referencia:
+    build:
+      context: ./referencia
+    container_name: referencia
+
   broker:
     build:
       context: ./broker
     container_name: broker
+    depends_on:
+      - referencia
 
   pubsub_proxy:
     build:
@@ -20,6 +27,7 @@ services:
     depends_on:
       - broker
       - pubsub_proxy
+      - referencia
 
   server2:
     build:
@@ -32,6 +40,7 @@ services:
     depends_on:
       - broker
       - pubsub_proxy
+      - referencia
 
   client1:
     build:

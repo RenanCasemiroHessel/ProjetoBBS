@@ -8,7 +8,9 @@ desenvolvido para a disciplina de Sistemas Distribuídos.
 O ProjetoBBS implementa um sistema distribuído de mensagens onde bots (clientes)
 podem realizar login, criar canais, publicar mensagens e receber mensagens de
 outros bots em tempo real. A comunicação é intermediada por um broker central
-para operações REQ/REP e por um proxy dedicado para o padrão PUB/SUB.
+para operações REQ/REP, por um proxy dedicado para o padrão PUB/SUB e por um
+serviço de referência responsável pela sincronização dos relógios e manutenção
+da lista de servidores disponíveis.
 
 ## Arquitetura
 
@@ -68,6 +70,31 @@ as mensagens enviadas pelo cliente.
   - O filtro de inscrição é feito por nome de canal, permitindo que cada bot
     receba apenas as mensagens dos canais em que está inscrito
 
+### Relógio Lógico (Lamport)
+- Implementado tanto no cliente Java (`LogicalClock.java`) quanto no servidor Python
+- **Regras seguidas:**
+  1. O contador é incrementado antes de cada envio de mensagem
+  2. Ao receber uma mensagem, o processo atualiza seu contador com
+     `clock = max(clock_local, clock_recebido) + 1`
+- Todas as mensagens trocadas carregam o campo `clock` além do `timestamp`
+- No cliente, `LogicalClock` usa `AtomicLong` para garantir segurança entre
+  as threads de Publisher e Subscriber
+
+### Serviço de Referência
+- Novo container `referencia.py` exclusivo para comunicação com os servidores
+- **Responsabilidades:**
+  - Atribuir rank ao servidor no momento do registro (primeira conexão)
+  - Armazenar a lista de servidores disponíveis (nome + rank, sem repetições)
+  - Fornecer a lista de servidores mediante requisição `list`
+  - Receber heartbeats periódicos e remover servidores inativos após timeout
+- **Heartbeat:** a cada 10 mensagens recebidas de clientes, o servidor envia
+  uma mensagem de heartbeat à referência. Aproveitando essa comunicação, o
+  servidor também recebe o horário atual da referência para **sincronizar seu
+  relógio físico**, calculando a diferença entre o tempo local e o tempo de
+  referência
+- Servidores que não enviarem heartbeat dentro de 30 segundos são
+  automaticamente removidos da lista de disponíveis
+
 ### Comportamento dos Bots
 Cada bot segue um loop contínuo com as seguintes regras:
 1. Se existem menos de 5 canais disponíveis → cria um novo canal
@@ -93,6 +120,9 @@ ProjetoBBS/
 ├── proxy/
 │ ├── Dockerfile
 │ └── pubsub_proxy.py
+├── referencia/
+│ ├── Dockerfile
+│ └── referencia.py
 ├── server/
 │ ├── Dockerfile
 │ └── server.py
@@ -102,7 +132,8 @@ ProjetoBBS/
 │ └── src/main/java/com/projetobbs/
 │ ├── Client.java
 │ ├── Publisher.java
-│ └── Subscriber.java
+│ ├── Subscriber.java
+│ └── LogicalClock.java
 ├── docker-compose.yml
 └── README.md
 ```
