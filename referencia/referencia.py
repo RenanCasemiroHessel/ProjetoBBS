@@ -12,7 +12,7 @@ servers = {}  # { nome: { "rank": int, "last_heartbeat": float } }
 rank_counter = 0
 lock = threading.Lock()
 
-HEARTBEAT_TIMEOUT = 30  # segundos sem heartbeat → remove servidor
+HEARTBEAT_TIMEOUT = 30
 
 def cleanup_loop():
     while True:
@@ -67,11 +67,8 @@ while True:
             name = msg.get("name", "")
             if name in servers:
                 servers[name]["last_heartbeat"] = time.time()
-                resp = {
-                    "status": "ok",
-                    "time": time.time(),
-                    "clock": clock_recv
-                }
+                # Parte 4: não retorna mais a hora — coordenador assume essa responsabilidade
+                resp = {"status": "ok", "clock": clock_recv}
                 print(f"[REFERENCIA] Heartbeat de '{name}' recebido.", flush=True)
             else:
                 resp = {"status": "error", "message": f"Servidor '{name}' nao encontrado", "clock": clock_recv}

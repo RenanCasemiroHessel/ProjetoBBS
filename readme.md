@@ -9,8 +9,9 @@ O ProjetoBBS implementa um sistema distribuído de mensagens onde bots (clientes
 podem realizar login, criar canais, publicar mensagens e receber mensagens de
 outros bots em tempo real. A comunicação é intermediada por um broker central
 para operações REQ/REP, por um proxy dedicado para o padrão PUB/SUB e por um
-serviço de referência responsável pela sincronização dos relógios e manutenção
-da lista de servidores disponíveis.
+serviço de referência responsável pela atribuição de ranks e manutenção da lista
+de servidores. A sincronização de relógio é gerenciada pelo servidor coordenador,
+eleito dinamicamente entre os servidores disponíveis.
 
 ## Arquitetura
 
@@ -81,19 +82,37 @@ as mensagens enviadas pelo cliente.
   as threads de Publisher e Subscriber
 
 ### Serviço de Referência
-- Novo container `referencia.py` exclusivo para comunicação com os servidores
+- Container `referencia.py` exclusivo para comunicação com os servidores
 - **Responsabilidades:**
   - Atribuir rank ao servidor no momento do registro (primeira conexão)
   - Armazenar a lista de servidores disponíveis (nome + rank, sem repetições)
   - Fornecer a lista de servidores mediante requisição `list`
-  - Receber heartbeats periódicos e remover servidores inativos após timeout
+  - Receber heartbeats periódicos e remover servidores inativos após 30 segundos
 - **Heartbeat:** a cada 10 mensagens recebidas de clientes, o servidor envia
-  uma mensagem de heartbeat à referência. Aproveitando essa comunicação, o
-  servidor também recebe o horário atual da referência para **sincronizar seu
-  relógio físico**, calculando a diferença entre o tempo local e o tempo de
-  referência
-- Servidores que não enviarem heartbeat dentro de 30 segundos são
-  automaticamente removidos da lista de disponíveis
+  uma mensagem de heartbeat à referência apenas para sinalizar que está ativo
+- A hora **não é mais retornada** pela referência — essa responsabilidade
+  passou para o servidor coordenador eleito (algoritmo de Berkeley)
+
+### Eleição de Coordenador (Bully)
+- Ao iniciar, cada servidor consulta a referência para obter a lista de servidores
+  e inicia uma eleição pelo **algoritmo Bully**:
+  1. Envia `REQ: eleição` para todos os servidores com rank superior
+  2. Cada servidor que recebe responde `REP: OK` e inicia sua própria eleição
+  3. O servidor que não recebe nenhum `OK` se declara coordenador
+- O coordenador eleito **publica seu nome no tópico `servers`** via proxy PUB/SUB
+- Todos os servidores estão inscritos no tópico `servers` e atualizam sua
+  variável `coordinator` ao receber o anúncio
+- A comunicação de eleição entre servidores usa sockets REQ/REP dedicados
+  na porta `5560 + SERVER_ID` de cada servidor
+
+### Sincronização de Relógio (Berkeley)
+- A cada **15 mensagens** processadas, o servidor não-coordenador sincroniza
+  seu relógio físico com o coordenador:
+  1. Envia `REQ: get_time` ao coordenador
+  2. Coordenador responde `REP: hora correta`
+  3. O servidor calcula e loga a diferença entre seu relógio local e o do coordenador
+- Se o coordenador não responde, o servidor inicia automaticamente uma nova eleição
+- O servidor coordenador não precisa sincronizar — ele é a referência de tempo
 
 ### Comportamento dos Bots
 Cada bot segue um loop contínuo com as seguintes regras:

@@ -47,8 +47,28 @@ pub_socket.connect("tcp://pubsub_proxy:5557")
 ref_socket = context.socket(zmq.REQ)
 ref_socket.connect("tcp://referencia:5559")
 
-# Registrar na referência e obter rank
+# Estado de eleição
+coordinator = None
+coordinator_lock = threading.Lock()
+rank = -1
+known_servers = []  # lista de {"name": ..., "rank": ...}
+
+# Socket REQ/REP entre servidores (eleição e sincronização Berkeley)
+election_rep = context.socket(zmq.REP)
+election_rep_port = 5560 + int(SERVER_ID)
+election_rep.bind(f"tcp://*:{election_rep_port}")
+
+def get_election_req(target_name):
+    target_id = target_name.replace("server", "")
+    port = 5560 + int(target_id)
+    s = context.socket(zmq.REQ)
+    s.setsockopt(zmq.RCVTIMEO, 2000)
+    s.setsockopt(zmq.LINGER, 0)
+    s.connect(f"tcp://{target_name}:{port}")
+    return s
+
 def register_on_reference():
+    global rank, known_servers
     c = tick()
     req = {"action": "register", "name": SERVER_NAME, "clock": c, "timestamp": time.time()}
     print(f"[SERVER-{SERVER_ID}] Registrando na referência com clock={c}...", flush=True)
@@ -60,41 +80,180 @@ def register_on_reference():
     print(f"[SERVER-{SERVER_ID}] Rank recebido: {rank}", flush=True)
     return rank
 
+def list_servers_from_reference():
+    global known_servers
+    c = tick()
+    req = {"action": "list", "clock": c, "timestamp": time.time()}
+    ref_socket.send(msgpack.packb(req))
+    raw = ref_socket.recv()
+    resp = msgpack.unpackb(raw, raw=False)
+    update_clock(resp.get("clock", 0))
+    known_servers = resp.get("servers", [])
+    return known_servers
+
+def elect_coordinator():
+    global coordinator, known_servers
+    print(f"[SERVER-{SERVER_ID}] Iniciando eleição...", flush=True)
+
+    servers = list_servers_from_reference()
+    higher = [s for s in servers if s["rank"] > rank and s["name"] != SERVER_NAME]
+
+    if not higher:
+        # Sou o de maior rank — me declaro coordenador
+        with coordinator_lock:
+            coordinator = SERVER_NAME
+        announce_coordinator()
+        print(f"[SERVER-{SERVER_ID}] Eleito como coordenador.", flush=True)
+        return
+
+    got_ok = False
+    for s in higher:
+        try:
+            req_sock = get_election_req(s["name"])
+            c = tick()
+            req_sock.send(msgpack.packb({"action": "election", "name": SERVER_NAME, "clock": c}))
+            raw = req_sock.recv()
+            resp = msgpack.unpackb(raw, raw=False)
+            update_clock(resp.get("clock", 0))
+            if resp.get("status") == "ok":
+                got_ok = True
+            req_sock.close()
+        except Exception as e:
+            print(f"[SERVER-{SERVER_ID}] Servidor {s['name']} indisponível na eleição: {e}", flush=True)
+
+    if not got_ok:
+        # Nenhum servidor de rank maior respondeu — me torno coordenador
+        with coordinator_lock:
+            coordinator = SERVER_NAME
+        announce_coordinator()
+        print(f"[SERVER-{SERVER_ID}] Nenhum servidor de rank superior respondeu. Eleito como coordenador.", flush=True)
+
+def announce_coordinator():
+    c = tick()
+    payload = {"coordinator": SERVER_NAME, "clock": c, "timestamp": time.time()}
+    pub_socket.send_multipart([
+        b"servers",
+        msgpack.packb(payload)
+    ])
+    print(f"[SERVER-{SERVER_ID}] Anunciou-se como coordenador no tópico 'servers'.", flush=True)
+
+def sync_clock_with_coordinator():
+    global coordinator
+    with coordinator_lock:
+        coord = coordinator
+
+    if coord is None:
+        print(f"[SERVER-{SERVER_ID}] Sem coordenador para sincronizar relógio.", flush=True)
+        elect_coordinator()
+        return
+
+    if coord == SERVER_NAME:
+        print(f"[SERVER-{SERVER_ID}] Sou o coordenador — sem necessidade de sincronizar.", flush=True)
+        return
+
+    try:
+        req_sock = get_election_req(coord)
+        c = tick()
+        req_sock.send(msgpack.packb({"action": "get_time", "name": SERVER_NAME, "clock": c}))
+        raw = req_sock.recv()
+        resp = msgpack.unpackb(raw, raw=False)
+        update_clock(resp.get("clock", 0))
+        ref_time = resp.get("time")
+        if ref_time:
+            diff = ref_time - time.time()
+            print(f"[SERVER-{SERVER_ID}] Relógio sincronizado com coordenador '{coord}'. Diferença: {diff:.4f}s", flush=True)
+        req_sock.close()
+    except Exception as e:
+        print(f"[SERVER-{SERVER_ID}] Coordenador '{coord}' indisponível. Iniciando nova eleição.", flush=True)
+        with coordinator_lock:
+            coordinator = None
+        elect_coordinator()
+
+def send_heartbeat():
+    global messages_since_heartbeat
+    try:
+        c = tick()
+        req = {"action": "heartbeat", "name": SERVER_NAME, "clock": c, "timestamp": time.time()}
+        ref_socket.send(msgpack.packb(req))
+        raw = ref_socket.recv()
+        resp = msgpack.unpackb(raw, raw=False)
+        update_clock(resp.get("clock", 0))
+        print(f"[SERVER-{SERVER_ID}] Heartbeat enviado à referência.", flush=True)
+        messages_since_heartbeat = 0
+    except Exception as e:
+        print(f"[SERVER-{SERVER_ID}] Erro no heartbeat: {e}", flush=True)
+
+def election_listener():
+    print(f"[SERVER-{SERVER_ID}] Ouvindo eleições na porta {election_rep_port}.", flush=True)
+    while True:
+        try:
+            raw = election_rep.recv()
+            msg = msgpack.unpackb(raw, raw=False)
+            action = msg.get("action")
+            clock_recv = msg.get("clock", 0)
+            update_clock(clock_recv)
+
+            if action == "election":
+                c = tick()
+                election_rep.send(msgpack.packb({"status": "ok", "clock": c}))
+                print(f"[SERVER-{SERVER_ID}] Respondeu OK para eleição de {msg.get('name')}.", flush=True)
+                # Inicio minha própria eleição em background
+                threading.Thread(target=elect_coordinator, daemon=True).start()
+
+            elif action == "get_time":
+                c = tick()
+                election_rep.send(msgpack.packb({"status": "ok", "time": time.time(), "clock": c}))
+
+            else:
+                c = tick()
+                election_rep.send(msgpack.packb({"status": "error", "message": "Acao desconhecida", "clock": c}))
+        except Exception as e:
+            print(f"[SERVER-{SERVER_ID}] Erro no listener de eleição: {e}", flush=True)
+
+# Subscriber para ouvir anúncios de coordenador no tópico 'servers'
+def coordinator_subscriber():
+    global coordinator
+    sub = context.socket(zmq.SUB)
+    sub.connect("tcp://pubsub_proxy:5558")
+    sub.subscribe(b"servers")
+    print(f"[SERVER-{SERVER_ID}] Inscrito no tópico 'servers'.", flush=True)
+    while True:
+        try:
+            sub.recv()  # tópico
+            raw = sub.recv()
+            msg = msgpack.unpackb(raw, raw=False)
+            new_coord = msg.get("coordinator")
+            update_clock(msg.get("clock", 0))
+            if new_coord:
+                with coordinator_lock:
+                    coordinator = new_coord
+                print(f"[SERVER-{SERVER_ID}] Novo coordenador: '{new_coord}'.", flush=True)
+        except Exception as e:
+            print(f"[SERVER-{SERVER_ID}] Erro no subscriber de coordenador: {e}", flush=True)
+
 data = load_data()
 messages_since_heartbeat = 0
-rank = -1
+messages_since_sync = 0
+
+# Iniciar threads auxiliares
+threading.Thread(target=election_listener, daemon=True).start()
+threading.Thread(target=coordinator_subscriber, daemon=True).start()
+
+time.sleep(1)
 
 try:
     rank = register_on_reference()
 except Exception as e:
     print(f"[SERVER-{SERVER_ID}] Erro ao registrar na referência: {e}", flush=True)
 
+# Aguarda um pouco para outros servidores registrarem, depois inicia eleição
+time.sleep(2)
+try:
+    elect_coordinator()
+except Exception as e:
+    print(f"[SERVER-{SERVER_ID}] Erro na eleição inicial: {e}", flush=True)
+
 print(f"[SERVER-{SERVER_ID}] Iniciado e conectado. Rank={rank}", flush=True)
-
-def send_heartbeat():
-    global messages_since_heartbeat
-    try:
-        c = tick()
-        req = {
-            "action": "heartbeat",
-            "name": SERVER_NAME,
-            "clock": c,
-            "timestamp": time.time()
-        }
-        ref_socket.send(msgpack.packb(req))
-        raw = ref_socket.recv()
-        resp = msgpack.unpackb(raw, raw=False)
-        update_clock(resp.get("clock", 0))
-
-        # Sincronização do relógio físico
-        ref_time = resp.get("time")
-        if ref_time:
-            diff = ref_time - time.time()
-            print(f"[SERVER-{SERVER_ID}] Heartbeat OK. Diferença de relógio físico: {diff:.4f}s", flush=True)
-
-        messages_since_heartbeat = 0
-    except Exception as e:
-        print(f"[SERVER-{SERVER_ID}] Erro no heartbeat: {e}", flush=True)
 
 while True:
     raw = rep_socket.recv()
@@ -105,6 +264,7 @@ while True:
 
     current_clock = update_clock(clock_recv)
     messages_since_heartbeat += 1
+    messages_since_sync += 1
 
     print(f"[SERVER-{SERVER_ID}] RECV | action={action} | user={msg.get('username')} | ts={timestamp} | clock={clock_recv}", flush=True)
 
@@ -163,13 +323,8 @@ while True:
 
     elif action == "list_servers":
         try:
-            c = tick()
-            ref_req = {"action": "list", "clock": c, "timestamp": time.time()}
-            ref_socket.send(msgpack.packb(ref_req))
-            raw_ref = ref_socket.recv()
-            ref_resp = msgpack.unpackb(raw_ref, raw=False)
-            update_clock(ref_resp.get("clock", 0))
-            resp = {"status": "ok", "servers": ref_resp.get("servers", []), "timestamp": time.time(), "clock": tick()}
+            servers = list_servers_from_reference()
+            resp = {"status": "ok", "servers": servers, "timestamp": time.time(), "clock": tick()}
         except Exception as e:
             resp = {"status": "error", "message": str(e), "timestamp": time.time(), "clock": tick()}
 
@@ -182,3 +337,8 @@ while True:
     # Heartbeat a cada 10 mensagens
     if messages_since_heartbeat >= 10:
         send_heartbeat()
+
+    # Sincronização de relógio com coordenador a cada 15 mensagens
+    if messages_since_sync >= 15:
+        sync_clock_with_coordinator()
+        messages_since_sync = 0
