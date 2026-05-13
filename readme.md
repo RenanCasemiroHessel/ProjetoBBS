@@ -114,6 +114,43 @@ as mensagens enviadas pelo cliente.
 - Se o coordenador não responde, o servidor inicia automaticamente uma nova eleição
 - O servidor coordenador não precisa sincronizar — ele é a referência de tempo
 
+### Consistência e Replicação
+
+**Problema:** O broker distribui requisições entre os servidores via round-robin.
+Com isso, cada servidor persiste apenas as mensagens que passou por ele — ao parar
+um servidor, parte do histórico é perdida.
+
+**Método escolhido: Replicação passiva baseada em log de eventos via PUB/SUB**
+
+O projeto já possui um proxy PUB/SUB (XSUB/XPUB) pelo qual todas as mensagens
+publicadas pelos clientes trafegam. A solução aproveita essa infraestrutura:
+cada servidor se inscreve em **todos os tópicos** (`subscribe("")`) do proxy e
+persiste localmente cada mensagem recebida, independentemente de qual servidor
+a originou.
+
+**Como funciona:**
+1. Um cliente publica uma mensagem → o broker encaminha para um servidor (round-robin)
+2. Esse servidor publica a mensagem no proxy PUB/SUB e persiste localmente
+3. O `replication_subscriber` de **todos os outros servidores** recebe a mensagem
+   via proxy e a persiste também no seu arquivo JSON local
+4. Ao final, todos os servidores possuem o mesmo conjunto de mensagens
+
+**Adaptações necessárias:**
+- Foi adicionado um lock (`data_lock`) para garantir acesso seguro ao arquivo JSON
+  entre a thread principal e a thread de replicação
+- Foi implementada verificação de duplicatas por combinação de
+  `(channel, username, timestamp, clock)` para evitar que o servidor que
+  originou a mensagem a salve duas vezes (uma direta e uma pelo subscriber)
+- O tópico interno `servers` (usado para anúncio de coordenador) é ignorado
+  pelo replicador
+
+**Por que este método?**
+- Aproveita a infraestrutura PUB/SUB já existente — sem necessidade de novos sockets
+- É tolerante a falhas: se um servidor cair e voltar, basta reiniciar e ele receberá
+  as próximas mensagens normalmente
+- É consistência eventual: todos os servidores convergem para o mesmo estado
+  assim que as mensagens trafegam pelo proxy
+
 ### Comportamento dos Bots
 Cada bot segue um loop contínuo com as seguintes regras:
 1. Se existem menos de 5 canais disponíveis → cria um novo canal

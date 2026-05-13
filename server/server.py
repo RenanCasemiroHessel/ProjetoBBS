@@ -51,12 +51,15 @@ ref_socket.connect("tcp://referencia:5559")
 coordinator = None
 coordinator_lock = threading.Lock()
 rank = -1
-known_servers = []  # lista de {"name": ..., "rank": ...}
+known_servers = []
 
 # Socket REQ/REP entre servidores (eleição e sincronização Berkeley)
 election_rep = context.socket(zmq.REP)
 election_rep_port = 5560 + int(SERVER_ID)
 election_rep.bind(f"tcp://*:{election_rep_port}")
+
+# Lock para acesso seguro ao data entre threads
+data_lock = threading.Lock()
 
 def get_election_req(target_name):
     target_id = target_name.replace("server", "")
@@ -94,12 +97,10 @@ def list_servers_from_reference():
 def elect_coordinator():
     global coordinator, known_servers
     print(f"[SERVER-{SERVER_ID}] Iniciando eleição...", flush=True)
-
     servers = list_servers_from_reference()
     higher = [s for s in servers if s["rank"] > rank and s["name"] != SERVER_NAME]
 
     if not higher:
-        # Sou o de maior rank — me declaro coordenador
         with coordinator_lock:
             coordinator = SERVER_NAME
         announce_coordinator()
@@ -122,7 +123,6 @@ def elect_coordinator():
             print(f"[SERVER-{SERVER_ID}] Servidor {s['name']} indisponível na eleição: {e}", flush=True)
 
     if not got_ok:
-        # Nenhum servidor de rank maior respondeu — me torno coordenador
         with coordinator_lock:
             coordinator = SERVER_NAME
         announce_coordinator()
@@ -131,10 +131,7 @@ def elect_coordinator():
 def announce_coordinator():
     c = tick()
     payload = {"coordinator": SERVER_NAME, "clock": c, "timestamp": time.time()}
-    pub_socket.send_multipart([
-        b"servers",
-        msgpack.packb(payload)
-    ])
+    pub_socket.send_multipart([b"servers", msgpack.packb(payload)])
     print(f"[SERVER-{SERVER_ID}] Anunciou-se como coordenador no tópico 'servers'.", flush=True)
 
 def sync_clock_with_coordinator():
@@ -190,14 +187,12 @@ def election_listener():
             raw = election_rep.recv()
             msg = msgpack.unpackb(raw, raw=False)
             action = msg.get("action")
-            clock_recv = msg.get("clock", 0)
-            update_clock(clock_recv)
+            update_clock(msg.get("clock", 0))
 
             if action == "election":
                 c = tick()
                 election_rep.send(msgpack.packb({"status": "ok", "clock": c}))
                 print(f"[SERVER-{SERVER_ID}] Respondeu OK para eleição de {msg.get('name')}.", flush=True)
-                # Inicio minha própria eleição em background
                 threading.Thread(target=elect_coordinator, daemon=True).start()
 
             elif action == "get_time":
@@ -210,7 +205,6 @@ def election_listener():
         except Exception as e:
             print(f"[SERVER-{SERVER_ID}] Erro no listener de eleição: {e}", flush=True)
 
-# Subscriber para ouvir anúncios de coordenador no tópico 'servers'
 def coordinator_subscriber():
     global coordinator
     sub = context.socket(zmq.SUB)
@@ -219,7 +213,7 @@ def coordinator_subscriber():
     print(f"[SERVER-{SERVER_ID}] Inscrito no tópico 'servers'.", flush=True)
     while True:
         try:
-            sub.recv()  # tópico
+            sub.recv()
             raw = sub.recv()
             msg = msgpack.unpackb(raw, raw=False)
             new_coord = msg.get("coordinator")
@@ -231,13 +225,77 @@ def coordinator_subscriber():
         except Exception as e:
             print(f"[SERVER-{SERVER_ID}] Erro no subscriber de coordenador: {e}", flush=True)
 
+# ---------------------------------------------------------------
+# PARTE 5: Replicação via PUB/SUB
+# Cada servidor escuta TODOS os tópicos e persiste mensagens
+# que não foram processadas por ele (publicadas por outro servidor)
+# ---------------------------------------------------------------
+def replication_subscriber():
+    sub = context.socket(zmq.SUB)
+    sub.connect("tcp://pubsub_proxy:5558")
+    sub.subscribe(b"")  # inscreve em todos os tópicos
+    print(f"[SERVER-{SERVER_ID}] Replicador inscrito em todos os tópicos.", flush=True)
+    while True:
+        try:
+            topic_bytes = sub.recv()
+            raw = sub.recv()
+            topic = topic_bytes.decode()
+
+            # Ignora tópico interno de coordenação
+            if topic == "servers":
+                continue
+
+            msg = msgpack.unpackb(raw, raw=False)
+            update_clock(msg.get("clock", 0))
+
+            channel  = msg.get("channel", topic)
+            message  = msg.get("message")
+            username = msg.get("username")
+            ts       = msg.get("timestamp")
+            clk      = msg.get("clock")
+
+            if not message:
+                continue
+
+            with data_lock:
+                # Replica canal se ainda não existe localmente
+                if channel not in data["channels"]:
+                    data["channels"].append(channel)
+                    print(f"[SERVER-{SERVER_ID}] REPLICA canal '{channel}'.", flush=True)
+
+                # Evita duplicatas: checa combinação canal+username+timestamp+clock
+                already = any(
+                    m.get("channel") == channel and
+                    m.get("username") == username and
+                    m.get("timestamp") == ts and
+                    m.get("clock") == clk
+                    for m in data["messages"]
+                )
+
+                if not already:
+                    entry = {
+                        "channel": channel,
+                        "message": message,
+                        "username": username,
+                        "timestamp": ts,
+                        "clock": clk
+                    }
+                    data["messages"].append(entry)
+                    save_data(data)
+                    print(f"[SERVER-{SERVER_ID}] REPLICA msg | canal={channel} | de={username} | clock={clk}", flush=True)
+
+        except Exception as e:
+            print(f"[SERVER-{SERVER_ID}] Erro no replicador: {e}", flush=True)
+
+# ---------------------------------------------------------------
+
 data = load_data()
 messages_since_heartbeat = 0
 messages_since_sync = 0
 
-# Iniciar threads auxiliares
 threading.Thread(target=election_listener, daemon=True).start()
 threading.Thread(target=coordinator_subscriber, daemon=True).start()
+threading.Thread(target=replication_subscriber, daemon=True).start()
 
 time.sleep(1)
 
@@ -246,7 +304,6 @@ try:
 except Exception as e:
     print(f"[SERVER-{SERVER_ID}] Erro ao registrar na referência: {e}", flush=True)
 
-# Aguarda um pouco para outros servidores registrarem, depois inicia eleição
 time.sleep(2)
 try:
     elect_coordinator()
@@ -258,7 +315,7 @@ print(f"[SERVER-{SERVER_ID}] Iniciado e conectado. Rank={rank}", flush=True)
 while True:
     raw = rep_socket.recv()
     msg = msgpack.unpackb(raw, raw=False)
-    action = msg.get("action")
+    action    = msg.get("action")
     timestamp = msg.get("timestamp")
     clock_recv = msg.get("clock", 0)
 
@@ -273,51 +330,64 @@ while True:
         if not username:
             resp = {"status": "error", "message": "Username obrigatorio", "timestamp": time.time(), "clock": tick()}
         else:
-            data["logins"].append({"username": username, "timestamp": timestamp})
-            save_data(data)
+            with data_lock:
+                data["logins"].append({"username": username, "timestamp": timestamp})
+                save_data(data)
             resp = {"status": "ok", "message": f"Bem-vindo {username}", "timestamp": time.time(), "clock": tick()}
 
     elif action == "create_channel":
         channel = msg.get("channel", "")
         if not channel:
             resp = {"status": "error", "message": "Nome do canal obrigatorio", "timestamp": time.time(), "clock": tick()}
-        elif channel in data["channels"]:
-            resp = {"status": "error", "message": f"Canal '{channel}' ja existe", "timestamp": time.time(), "clock": tick()}
         else:
-            data["channels"].append(channel)
-            save_data(data)
-            resp = {"status": "ok", "message": f"Canal '{channel}' criado", "timestamp": time.time(), "clock": tick()}
+            with data_lock:
+                if channel in data["channels"]:
+                    resp = {"status": "error", "message": f"Canal '{channel}' ja existe", "timestamp": time.time(), "clock": tick()}
+                else:
+                    data["channels"].append(channel)
+                    save_data(data)
+                    resp = {"status": "ok", "message": f"Canal '{channel}' criado", "timestamp": time.time(), "clock": tick()}
 
     elif action == "list_channels":
-        resp = {"status": "ok", "channels": data["channels"], "timestamp": time.time(), "clock": tick()}
+        with data_lock:
+            channels = list(data["channels"])
+        resp = {"status": "ok", "channels": channels, "timestamp": time.time(), "clock": tick()}
 
     elif action == "publish":
-        channel = msg.get("channel", "")
-        message = msg.get("message", "")
+        channel  = msg.get("channel", "")
+        message  = msg.get("message", "")
         username = msg.get("username", "")
         if not channel:
             resp = {"status": "error", "message": "Nome do canal obrigatorio", "timestamp": time.time(), "clock": tick()}
         elif not message:
             resp = {"status": "error", "message": "Mensagem vazia", "timestamp": time.time(), "clock": tick()}
         else:
-            if channel not in data["channels"]:
-                data["channels"].append(channel)
-                save_data(data)
-                print(f"[SERVER-{SERVER_ID}] Canal '{channel}' replicado de outro servidor.", flush=True)
             c = tick()
             pub_payload = {
-                "channel": channel,
-                "message": message,
-                "username": username,
+                "channel":   channel,
+                "message":   message,
+                "username":  username,
                 "timestamp": timestamp,
-                "clock": c
+                "clock":     c
             }
-            pub_socket.send_multipart([
-                channel.encode(),
-                msgpack.packb(pub_payload)
-            ])
-            data["messages"].append(pub_payload)
-            save_data(data)
+            pub_socket.send_multipart([channel.encode(), msgpack.packb(pub_payload)])
+
+            # O replication_subscriber de TODOS os servidores vai capturar e persistir
+            # O servidor atual também persiste diretamente (sem depender do subscriber)
+            with data_lock:
+                if channel not in data["channels"]:
+                    data["channels"].append(channel)
+                already = any(
+                    m.get("channel") == channel and
+                    m.get("username") == username and
+                    m.get("timestamp") == timestamp and
+                    m.get("clock") == c
+                    for m in data["messages"]
+                )
+                if not already:
+                    data["messages"].append(pub_payload)
+                save_data(data)
+
             resp = {"status": "ok", "message": "Mensagem publicada", "timestamp": time.time(), "clock": c}
             print(f"[SERVER-{SERVER_ID}] PUB | canal={channel} | user={username} | msg={message} | clock={c}", flush=True)
 
@@ -334,11 +404,9 @@ while True:
     print(f"[SERVER-{SERVER_ID}] SEND | status={resp['status']} | clock={resp['clock']}", flush=True)
     rep_socket.send(msgpack.packb(resp))
 
-    # Heartbeat a cada 10 mensagens
     if messages_since_heartbeat >= 10:
         send_heartbeat()
 
-    # Sincronização de relógio com coordenador a cada 15 mensagens
     if messages_since_sync >= 15:
         sync_clock_with_coordinator()
         messages_since_sync = 0
